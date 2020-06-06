@@ -1,0 +1,608 @@
+---
+title: "Lab 2 - Elections and RNA-sequencing"
+author: "Liav A. and Yedidya W."
+date: "5/26/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(dendextend)
+library(MASS)
+library(tictoc)
+library(ggplot2)
+library(tm)
+library(arrangements)
+library(GGally)
+library(maps)
+library(plotly)
+library(nullabor)
+library(reshape2)
+
+library(tabulizer)
+
+library(glue)
+
+
+library(Matrix)
+library(wordspace)
+```
+### Sumulation Study
+#### 1.1 The data generation process
+We begin with generating 3 mean vectors from the standard-normal distribution, where $\mu_{i,j}$ is IID for all $i \in \{1,2,3\}$, $j \in \{1,..,10\}$, where these mean vectors will be used draw samples from the 3 multivariate normal distributions, respectively. <br>
+
+```{r 1 - Simulation Study-means, message=FALSE, warning=FALSE, include=FALSE}
+set.seed(20200515)
+mu = list(m20=rnorm(10,0,1), m50=rnorm(10,0,1), m100=rnorm(10,0,1))
+# 3 vectors with first 10 coordinates of sample mean
+print(t(as.data.frame(mu)))
+```
+
+Next, we implement a function `gen_sample` which draws a sample of 100 observations from the multivariate normal distribution, given $\mu ,p$ and $\sigma^{2}_{\epsilon}$ as the mean vector, number of dimensions and the variance scale respectively. for `p > 10` we extend the mean vectors to length `p` by adding `p-10` zeroes.<br>
+Where the first 20 observations belong to $\mu_1$, observations 21-50 belong to $\mu_2$, and the remaining 50 observation belong to $\mu_3$. <br>
+
+```{r 1 - Simulation Study-function, include=FALSE}
+gen_sample = function(mu, p, sigma2_e=1){
+    df = tibble()
+    for (i in 1:length(mu)){
+        if(p>10){
+            zos = replicate(p-10, 0)
+            sample_mu = c(mu[[i]], zos)
+        } else {
+            sample_mu = mu[[i]]
+        }
+        #sample_mu = c(mu[[i]], replicate(ifelse(p>=10, p-10, 0), 0))
+        
+        Xi = mvrnorm(ifelse(i==1, 20, ifelse(i==2, 30, 50)), sample_mu, sigma2_e * as.matrix(diag(p)), tol=1e-6)
+        df = rbind(df, Xi)
+    }
+    return(tibble(df))
+}
+```
+
+**Drawing 4 random variances**<br>
+
+We choose arbirarily 4 levels of $\sigma^{2}_{\epsilon}$, which will be used for defining the distributions when drawing the different sample datasets.<br>
+
+```{r 1 - Simulation Study-intialize levels, echo=FALSE}
+sig2 = c(0.5,1,3,9) # 4 random levels of variance.
+print(sig2)
+```
+#### Generating samples:
+In this section we generate 100 sample from each distribution (i.e, for each variance $\sigma^{2}_{\epsilon} \in \{$ `r toString(sig2)` $\}$ and according to the mean vectors) for 3 different dimensions / sizes ($p\in\{10, 20, 50\}$), 1200 sample datasets in total.<br>
+
+For each sample/iteration: <br>
+  1. Run the kmeans algorithm and save the accuracy/clustering results.<br>
+  2. Implement PCA algorithm and use the samples/scores after PCA.<br>
+  3. Run kmeans on the PCA scores and save the accuracy results from this variation of kmeans.<br>
+  4. calculate the runtime.<br>
+  
+We calculate the accuracy of each sample by summarizing the kmeans output in a 3x3 table, where each row indicates the class of the real cluster and the columns are the 'predicted' values given by the kmeans output. Then for each table we calculate the confusion matrix, from all possible permutations of the "correct clusters" (with k=3 we have $3!$ possible permutations) we choose the one which produces the **maximum accuracy**.<br>
+
+```{r 1 - Simulation Study- cluster frequency, include=FALSE}
+
+get_clust_freq = function(clust){
+  # Creates table of kmeans algorithim clustering, rows correspond to real cluster 
+  #   and columns correspond to kmeans clustering. 
+  # Diagnol = accurate clusters, off-diagonal = false clustering.
+  # param clust: clusters vector from kmeans output
+  # return: table of k clusters frequency
+  clusters = c(clust)
+  clust_tbl = matrix(ncol =3)
+  s=1
+  for (c in sort(unique(clusters))){
+    
+    c_range = ifelse(c==1, 20, ifelse(c==2, 50, 100))
+
+    k = table(clusters[s:c_range])
+    clust_tbl = rbind(clust_tbl, k)
+    s = c_range + 1
+    
+  }
+  return(as.data.frame(clust_tbl[-1,]))  
+}
+
+get_max_permu = function(clus_matrix){
+  # permutates all possible accuracies from the confusion matrix.
+  # param clus_matrix: 3x3 accuracy matrix
+  # return: maximum accuracy from confusion matrix.
+  combi = permutations(x = c(1,2,3), k = 3, replace = F)
+  res = c()
+  for (p in 1:nrow(combi)){
+    permu = combi[p,]
+    d = c(clus_matrix[1,permu[1]], clus_matrix[2,permu[2]] ,clus_matrix[3,permu[3]])
+    res[p] = sum(d)
+  }
+  m = max(res)
+  return(m)
+}
+```
+
+**Now to draw samples:**<br>
+
+```{r 1 - Simulation Study-kmeans iterations, message=FALSE, warning=FALSE, include=FALSE}
+
+j=0
+time_capsule = c()
+pca_time =c()
+# km_asis = c()
+# km_pcas = c()
+kmeans_df = tibble()
+pca_k_df = tibble()
+
+for (p in c(10, 20, 50)){
+    for (s in sig2){
+        for (i in 1:100){
+            j = j + 1
+            df = gen_sample(mu,p,s)
+
+            t0 = tic()
+            km = kmeans(df, 3, iter.max = 10000)
+            t0 = toc(quiet=T)
+            
+            km_freq = as.matrix(get_clust_freq(km$cluster))
+            row_data = list(iteration=j, accuracy=get_max_permu(km_freq), P=p, sig2=s, duration=as.numeric(t0$toc- t0$tic) )
+            kmeans_df  = rbind(kmeans_df, row_data)
+            
+            pca_res = prcomp(df, retx=TRUE, center = TRUE, scale=TRUE, rank. = 3)
+            t1= tic()
+            #setting scale and center True to use the CORR(X) matrix instead of COV(X)
+            km_pca = kmeans(pca_res$x, 3, iter.max=1e5) # use pca scores in kmeans
+            t1 = toc(quiet=T)
+            pca_freq = as.matrix(get_clust_freq(km_pca$cluster))
+            
+            pca_data = list(iteration=j, accuracy=get_max_permu(pca_freq), P=p, sig2=s, duration=as.numeric(t1$toc- t1$tic))
+            pca_k_df  = rbind(pca_k_df, pca_data)
+        }
+    }
+}
+kmeans_df['algorithm']= 'K-means only'
+pca_k_df['algorithm']='PCA + K-means'
+kmerged_df=as.data.frame(rbind(kmeans_df, pca_k_df))
+
+```
+
+#### 1.6 - Average accuracy for every algorithm
+- Heatmap table - Summarising accuracy results from all samples for each set of $\{p,\sigma^2\}$: <br>
+
+```{r 1 - Simulation Study-kmeans aggregation, echo=FALSE, fig.height=5, fig.width=10}
+
+df_km = kmeans_df %>% 
+  group_by(P_cols=P, sig_level=sig2)  %>%
+  summarise(avg_accuracy=mean(accuracy), sd_err = sd(accuracy), avg_duration = mean(duration), index=min(iteration))
+
+df_pca = pca_k_df %>% 
+  group_by(P_cols=P, sig_level=sig2)  %>%
+  summarise(avg_accuracy=mean(accuracy), sd_err = sd(accuracy), avg_duration = mean(duration), index=min(iteration))
+
+diff_df = as.data.frame(as.matrix(df_km) - as.matrix(df_pca))
+df_km['algorithm']= 'K-means only'
+
+df_pca['algorithm']='PCA + K-means'
+
+merge_df = rbind(df_km, df_pca)
+
+ggplot(data=merge_df, aes(x=factor(P_cols), y=factor(sig_level)))+ 
+  geom_tile(aes(fill=avg_accuracy)) + 
+  geom_text(aes(label=round(avg_accuracy,2)), show.legend = F)+facet_grid(algorithm~.)+ 
+  scale_fill_gradient2(high ='springgreen', name="Accuracy",
+                       mid = 'seashell',
+                       low ='firebrick1',
+                       midpoint =median(merge_df$avg_accuracy),
+                       space = "Lab",
+                       na.value = "grey50",
+                       guide = "colourbar",
+                       aesthetics = "fill")  +
+  labs(y="Standard Deviation", x="P (Dimensions)", title = "Accuracy Table: P vs. Sd") + theme_set(theme_gray(base_size = 18)) +
+   theme(plot.title = element_text(hjust = 0.5, size = 32, face='bold', color='steelblue'),plot.margin =unit(c(1.5,1.5,1.5,1.5), 'cm')) 
+```
+- In the heatmap table splitted by algorithm we see that for both as $\sigma^{2}_{\epsilon}$ increases, the accuracy of the K-means decreases. <br>
+- Furthermore, we see that also as the number of columns $p \in \{10,20,50\}$ increases the the accuracy decreases, though not as significantly. <br>
+- Thus, we may conclude that preforming PCA on the data, doesn't improve the K-means algrorithm average accuracy. (perhaps even we can see a slightly larger drop in the accuracy compared to the K-means without PCA).
+<br>
+
+```{r 1 - Simulation Study-boxplot, echo=FALSE, fig.height=6, fig.width=12}
+
+ggplot(kmerged_df, aes(x=as.factor(P), y=accuracy, color=as.factor(sig2))) + geom_boxplot()+ facet_grid(.~algorithm) +
+  labs(x="P (Number of Dimension)", y="Accuracy", title="Accuracy Boxplots Comparison\n") + 
+  scale_y_continuous(labels = function(x) paste0(x, "%")) + theme(plot.title = element_text(hjust = 0.5, size = 20)) +
+   guides(color=guide_legend(title="Variance"))+theme_set(theme_gray(base_size = 18)) +
+   theme(plot.title = element_text(hjust = 0.5, size = 32, face='bold', color='steelblue'),plot.margin =unit(c(1.5,1.5,1.5,1.5), 'cm')) 
+
+```
+**Comparing the K-means Results: **<br>
+- The Average accuracy of the K-means with PCA vs K-means without is lower at each level of comparison.<br>
+- As the number of dimensions $p$ and the variance level $\sigma^2_\epsilon$ increase, the accuracy is reduced for both algorithms.<br>
+
+#### 1.7 - Runtime Comparison: <br>
+- We measured the runtime of each algoritm at every iteration, now we can compare the preformance of the algorithms.
+- For every set of $(p, \sigma^2)$ we have 100 iterations/samples,  
+and we got: <br>
+```{r 1 - Simulation Study-times plot, echo=FALSE, fig.height=8, fig.width=16, message=FALSE, warning=FALSE}
+tag_times = sprintf("Total Runtime: %s (sec.)\nMean Iteration Duration: %s (sec.)\nStandard Deviation: %s (sec.)\nIterations: %s",
+                    round(sum(kmerged_df$duration)/2,1),
+                    round(mean(kmerged_df$duration),3), 
+                    round(sd(kmerged_df$duration),3),
+                    j)
+                    
+time_plot = ggplot()+
+      geom_path(data =kmerged_df %>% filter(algorithm=='K-means only'),aes(y=cumsum(duration), x=iteration, color=algorithm), size=2)+
+      geom_path(data =kmerged_df %>% filter(algorithm=='PCA + K-means'),aes(y=cumsum(duration), x=iteration, color=algorithm), size=2)+
+  labs(title='K-means Iteration Runtime', x='Iterations', y='Iteration Duration (sec.)', tag=tag_times)+
+    theme(plot.title = element_text(hjust = 0.5, face = 'bold',size = 32, color = 'navy'),
+          plot.subtitle = element_text(hjust = 0.5, face = 'bold',size = 24, color = 'black'),
+          plot.background = element_rect(fill=NULL, color='black', size = 1),
+          plot.margin =unit(c(1,1,1,1), 'cm'),
+          plot.tag = element_text(face='bold', color='black', size=18, hjust =0),
+          plot.tag.position = c(0.1,.8),
+          panel.background = element_blank(),
+          panel.border = element_rect(fill=NA, color = 'black', size=2),
+          panel.grid.major = element_line(color='grey60', size=0.5,linetype = 'dashed'),
+          panel.grid.minor = element_line(color='grey80', size=0.25, linetype = 'dashed'),
+          axis.title=element_text(hjust = 0.5, face = 'bold',size = 18, color = 'black'),
+          axis.text.x = element_text(angle=0, size=18, hjust=0.5),
+          axis.text.y = element_text(size=18)) +
+  scale_x_discrete(expand=c(0,0), limits = c(seq(0,1200, 100)))
+  
+time_plot
+```
+**Runtime Results**
+<br>
+- As can be seen in the figure above, the cumulative duration of K-means algorithm with PCA (blue path) was roughly half of the duration of the K-means without (red path).<br>
+
+- Furthermore, we see that there is a significant jump in duration around the 800th iteration, which corresponds to $p=50$. In general, the slope of the K-means without PCA seems to increase exponentially as $p$ increases.<br>
+
+- On the other hand, the K-means with PCA appears more linear, this is due to limiting the PCA to 3 dimensions even though the dimensions of the data is changing. i.e., the dimensions of the PCA did not change with each iteration.
+<br>
+
+---
+
+### Question 2 - Comparing demographic and election data:
+<br>
+
+In this section we begin by loading the `elections 23` and `scoial demographics` datasets, we use the `demographics pdf table` file to map between the hebrew municipality names that appear in the `elections` dataset and the english municipality names that appear in the `demographics` dataset.<br>
+
+```{r 2 - Comparing demographic and election data, include=FALSE}
+# load socio economic data
+socio = read.csv("cbs_demographics.txt", sep="\t")
+#load elections data
+votes = read.csv("knesset23_res.csv")
+# remove empty column (the last column is just a mistake)
+# votes = votes[,-dim(votes)]
+
+tmp_items = extract_tables('demographics_pdftable.pdf', encoding="UTF-8")
+muni_names = rbind(cbind(city.name=c(tmp_items[[1]][,1]), שם.ישוב=removeNumbers(c(tmp_items[[1]][,13]))),
+                   cbind(city.name=c(tmp_items[[2]][,1]), שם.ישוב=removeNumbers(c(tmp_items[[2]][,13]))), 
+                   cbind(city.name=c(tmp_items[[3]][,1]), שם.ישוב=removeNumbers(c(tmp_items[[3]][,14]))))
+# rm(tmp_items)
+df = unique(as.data.frame(muni_names))
+not_muni = c('', ' ','NAME OF LOCAL', 'AUTHORITY', 'AVERAGE', 'NATIONWIDE VALUE')
+city_names = df %>% filter(!(city.name %in% not_muni | שם.ישוב %in% not_muni)) # english to hebrew municipality names map
+```
+
+<br>
+
+#### 2.1 - Sampling 20 Cities
+<br>
+
+- We think it's important to note that **not** all these datasets have the same exact municipalities in them, with the `elections` dataset containing `r dim(votes)[1]` municipalities, and the `demographics` dataset containing `r dim(socio)[1]` municipalities. 
+- Thus when we sample, we sample at random 20 cities from the intersection of cities contained in both the `elections` and the `demographics` datasets. <br>
+
+```{r Comparing demographic and election data - preprocessing, include=FALSE}
+#round population
+socio$population = round(socio$population)
+
+votes = votes %>% left_join(city_names, by=c("שם.ישוב"="שם.ישוב"))
+votes %>% filter(! is.na(city.name))
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+set.seed(20)
+intersect_cities = intersect(votes$city.name, socio$village)
+sampeled_cities = intersect_cities %>% sample(20)
+
+votes_20 = votes %>% filter(city.name %in% sampeled_cities) %>% arrange(city.name)
+socio_20 = socio %>% filter(village %in% sampeled_cities) %>% arrange(village)
+
+# print(votes_20[, c(38, 7)])
+
+sample_votes_cities = function(cities_20=NA){
+  if (is.na(cities_20)){
+    cities_20 = intersect_cities %>% sample(20)
+  }
+  df = votes %>% filter(city.name %in% cities_20)  %>% arrange(city.name)
+
+  df_pct = df[,8:37]/rowSums(df[,8:37])
+  rownames(df_pct) = cities_20
+  return(df_pct)
+}
+```
+
+#### 2.2-3 Construct a hierarchical tree for the elections and demographics data.
+<br>
+- We normalize the voting data by taking the proportion of number of votes for each party of the total number of votes. <br>
+- The demographic datset we normalize with scale and center on each column.<br>
+- Once both datasets have been set to the same scale, we can compare the similarity between them.
+- For both datasets, we user the euclidian distance and the `average` linkange.
+<br>
+
+```{r echo=FALSE, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+
+votes_only = votes_20[,8:37] # only (numeric) voting data
+socio_only = socio_20[,1:15] # only numeric
+row.names(socio_only) = socio_20$village
+#socio_only = scale(socio_only)
+votes_scaled = votes_only/rowSums(votes_only)
+
+rownames(votes_scaled) = votes_20$city.name
+socio_scaled = scale(socio_only)
+
+
+
+votes_dend = votes_scaled %>% dist(method="euclidean") %>% hclust("average") %>% as.dendrogram()%>% highlight_branches() %>%  color_labels(k=5) 
+
+socio_dend = socio_scaled %>% dist(method="euclidean") %>% hclust("average") %>% as.dendrogram()%>% highlight_branches() %>%  color_labels(k=5)
+
+par(mfrow = c(2,1))
+
+plot(votes_dend)
+plot(socio_dend)
+```
+
+<br>
+
+#### 2.4 - Comparing the voting and demographics dendogram:
+<br>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+tanglegram(votes_dend, socio_dend, sort=T)
+```
+<br>
+**Comparison Results:**
+<br>
+- From the dendogram it appears the the demographic data and the voting data for the random 20 cities, are not very similar, with only 2 branches returned by both with a small distance. <br>
+- We see that the arab cities were clustered closely in both, but no perfect matches. 
+- In general, it appears that the clusters are somewhat similar. <br>
+
+#### 2.5 - Similarity Score
+
+- We chose the 'Cophonetic distance' since it supposed to be the faster method to compute the score. The value is the correlation similarity between two groups, and thus ranges between -1 and 1, with 0 meaning that the trees are not statisticall similar. <br>
+
+#### 2.6 - Finding the background distribution
+<br>
+In the section we permutate the names of the cities of the votes dendogram while keeping the demographics dendogram fixed, we save the similarity score in each iteration using as above, the `Cophonetic Correlation`. <br>
+
+- Once we have all the scores we can estimate the density distribution of the dataset. We then compare the score from the real data in the distribution and calculate the p-value.<br>
+
+Our hypothesis: <br>
+The voting and demographic datasets are completely not similar.<br>
+
+ - $H_{0}: corr_{Cophonetic}(votes, demographics) = 0$ <br>
+
+ - $H_{1}: corr_{Cophonetic}(votes, demographics) ≠ 0$ <br>
+
+We will reject the null-hypothesis for $p_{value}>0.05$. <br>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+dend_corr = cor_cophenetic(votes_dend, socio_dend)
+
+set.seed(23801)
+
+N <- 100
+ccr_results <- numeric(N)
+dend_mixed <- votes_dend
+for(i in 1:N) {
+   dend_mixed <- sample.dendrogram(dend_mixed, replace = FALSE)
+   ccr_results[i] <- cor_cophenetic(dend_mixed, socio_dend)
+}
+
+t_val = mean(ccr_results) / sqrt(var(ccr_results)/N)
+pval = 2*pt(t_val, df=N-1, lower=FALSE)
+
+tag_text = sprintf('Mean: %s\n std-err: %s\np-value: %s\n statistic: %s',
+                   round(mean(ccr_results),3), 
+                   round(sd(ccr_results),3),
+                   round(pval,3),
+                   round(t_val, 3))
+
+ggplot(as.data.frame(ccr_results)) + geom_density(aes(x=ccr_results)) + xlim(-.5,.5) + geom_vline(aes(xintercept=0), linetype='dashed')+
+    geom_vline(aes(xintercept=dend_corr, color='Data Cophenetic Corr.'), linetype='dashed') +
+  geom_vline(aes(xintercept=mean(ccr_results), color='Mean Cophenetic Corr.'), linetype='dashed') +
+    geom_vline(aes(xintercept=t_val, color='Critical Statistic (P-Value)'), linetype='dashed')+
+  labs(title='Cophonetic Score Permutations - Background distribution',x='', y='Density', 
+       tag=tag_text) + 
+theme(plot.title = element_text(hjust = 0.5, face = 'bold',size = 12, color = 'navy'),
+          plot.background = element_rect(fill=NULL, color='black', size = 1),
+          plot.margin =unit(c(1,1,1,1), 'cm'),
+          plot.tag = element_text(face='bold', color='black', size=10, hjust =0),
+          plot.tag.position = c(0.1,.8),
+          legend.text = element_text(angle=0, size=6, hjust=0.5),
+          legend.title = element_blank(),
+          panel.background = element_blank(),
+          panel.border = element_rect(fill=NA, color = 'black', size=2),
+          axis.title=element_text(hjust = 0.5,size = 0, color = 'black'),
+          axis.text.x = element_text(angle=0, size=10, hjust=0.5))
+
+```
+<br>
+**Hypothesis Testing Results**
+<br>
+- Under our null hypothesis that the tree labels are completely unrelated, we don't reject the null-hypothesis that $\mu_{H_{0}} = 0$, with a $p_{value} =$ `r toString(round(pval,3))`.<br>
+
+---
+
+## 3. Exploratory analysis of RNA seq data
+<br>
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+# this is just the code for the app, doesn't run in markdown.
+med_dat = read.delim ("gtex.gct", skip = 2, row.names=c(1), header = TRUE)
+gen_names = med_dat[,1]
+med_dat = med_dat[,-c(1)]
+
+tissues = colnames(med_dat)
+
+med_dat_t = t(med_dat)
+
+med_dat_t_clean = as.data.frame(med_dat_t[,which(apply(med_dat_t, 2, sd)!=0)])
+
+
+#create pc analysis
+pca = prcomp(med_dat_t_clean, center = TRUE ,scale = TRUE)
+
+
+#create 3-dimensional dataframe
+med_dat_3d = as.data.frame(pca$x[,1:3])
+#create 2-dimensional dataframe
+med_dat_2d = as.data.frame(pca$x[,1:2])
+
+
+# this function initials the first centroids randomally from our data
+# param k: number of centroids
+# param data: our data
+# return: a vector of centroids
+init_centroids = function(k, data) {
+  cent = data[sample(1:nrow(data), k), ]
+  return(cent)
+}
+
+# this function assign split data to clusters by cluster centroids list
+# param centroids: a list of centroids
+# param data: dataframe
+# return: a list of clusters (by index)
+assign_to_clusters = function(centroids, data) {
+  colnames(centroids) = colnames(data)
+  distance = dist(rbind(data,centroids))
+  n_dat = nrow(data)
+  n_cen = nrow(centroids)
+  d = as.matrix(distance)[(n_dat + 1):(n_dat+n_cen),1:n_dat]
+  results = apply(d,2,function(x) which(x == min(x)))
+  clusters = as.numeric(unlist(results))  
+  return(clusters)
+}
+
+
+# this function recalculate centroids of clusters by calculating the new mean of cluster
+# param data: the data
+# param clus_lst: the clusters list (indices of clusters)
+# param k: number of clusters
+# return: new centroids of current clusters
+recalc_centroids = function(data, clus_lst, k) {
+  d = data.frame(matrix(0, ncol = dim(data)[2],nrow=k)) 
+  for (i in 1:k) {
+    cent = colMeans(data[clus_lst==i,])
+    d[i,] = cent
+  }
+  
+  return(d)
+}
+
+check_diff = function(cent_after, cent_before, eps){
+  dif = as.matrix(cent_after - cent_before)
+  score = apply(dif, 1, norm, type="2")
+  if (all(score<=eps)){
+    return(FALSE)
+  }
+  else{
+    return(TRUE)
+  }
+}
+
+# this is a k means algorithm from scratch
+k_means = function(k, data, eps=1e-3, max_iter=10) {
+  #1
+  #2+3
+  cent0 = init_centroids(k, data)
+  
+  
+  clusters0 = assign_to_clusters(centroids = cent0, data = data)
+  #4
+  cent = recalc_centroids(data=data,clus_lst = clusters0 , k=k)
+  #5
+  is_diff = check_diff(cent_before = cent0, cent_after = cent, eps=eps)
+  iter = 0
+  while( (is_diff) && (iter <= max_iter) ){
+    iter = iter + 1
+    clusters = assign_to_clusters(centroids = cent, data=data)
+    cent0 = cent
+    cent = recalc_centroids(data=data,clus_lst = clusters , k=k)
+    clusters = assign_to_clusters(centroids = cent, data=data)
+    is_diff = check_diff(cent_before = cent0, cent_after = cent, eps=eps)
+  }
+  return(clusters)
+}
+
+
+# Define UI for random distribution app ----
+ui <- fluidPage(
+  
+  # App title ----
+  titlePanel("KMeans Algorithm Comparison - 2D and 3D Genes Data"),
+  
+  # Sidebar layout with input and output definitions ----
+  sidebarLayout(
+    
+    # Sidebar panel for inputs ----
+    sidebarPanel(
+      
+      # br() element to introduce extra vertical spacing ----
+      br(),
+      
+      # Input: Slider for the number of observations to generate ----
+      sliderInput("slider",
+                  "Number of clusters:",
+                  value = 4,
+                  min = 2,
+                  max = 10)
+      
+    ),
+    
+    # Main panel for displaying outputs ----
+    mainPanel(
+      
+      # Output: Tabset w/ plot, summary, and table ----
+      tabsetPanel(type = "tabs",
+                  tabPanel("2D Plot", plotlyOutput("plot")),
+                  tabPanel("3D Plot", plotlyOutput("summary"))
+                  
+      )
+      
+    )
+  )
+)
+# Define server logic for random distribution app ----
+server <- function(input, output) {
+  
+  output$plot <- renderPlotly({
+    clusters = k_means(k=input$slider, data=med_dat_t_clean)
+    results_df = cbind(med_dat_2d,as.factor(clusters))
+    colnames(results_df) = c("PC1","PC2","color")
+    
+    plot_ly(data=results_df, x=~PC1, y=~PC2,  
+            type="scatter", mode="markers", color=~color, text=tissues)     
+  })
+  
+  output$summary <- renderPlotly({
+    clusters = k_means(k=input$slider, data=med_dat_t_clean)
+    
+    results_df = cbind(med_dat_3d,as.factor(clusters))
+    colnames(results_df) = c("PC1","PC2","PC3","color")
+    
+    plot_ly(data=results_df, x=~PC1, y=~PC2, z=~PC3, 
+               type="scatter3d", mode="markers", color=~color, text=tissues) 
+  })
+  
+}
+
+
+shinyApp(ui = ui, server = server)
+```
+
+
+```{r 3 - Shiny App, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::include_url('https://liav.shinyapps.io/k_means/', height='720px')
+
+```
